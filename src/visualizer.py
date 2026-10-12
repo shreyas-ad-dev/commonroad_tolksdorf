@@ -1,0 +1,371 @@
+# src/visualizer.py
+
+import matplotlib.pyplot as plt
+import numpy as np
+from commonroad.visualization.mp_renderer import MPRenderer
+from matplotlib import patches
+from shapely.geometry import MultiPolygon
+
+from src.ego_state import EgoState
+from src.sensor_suite import SensorSuite
+
+
+def plot_shapely_geometry(
+        ax,
+        geom,
+        facecolor,
+        edgecolor,
+        alpha=0.22,
+        zorder=70
+    ):
+    """Utility to render Shapely Polygons or MultiPolygons onto Matplotlib axes."""
+    if geom is None or geom.is_empty:
+        return
+
+    geoms = geom.geoms if isinstance(geom, MultiPolygon) else [geom]
+    for g in geoms:
+        if g.geom_type == 'Polygon' and not g.is_empty:
+            exterior_coords = np.array(g.exterior.coords)
+            ax.add_patch(patches.Polygon(
+                exterior_coords, closed=True,
+                facecolor=facecolor, edgecolor=edgecolor,
+                alpha=alpha, linewidth=1.0, zorder=zorder
+            ))
+
+
+def draw_obstacle_trajectories(
+        ax,
+        obstacles,
+        zorder=50
+    ):
+    """
+    Draws predicted dotted trajectory paths for surrounding traffic obstacles.
+
+    Args:
+        ax (plt.Axes): Matplotlib axes instance to draw trajectories on.
+        obstacles (list): List of obstacle objects to project trajectories for.
+        zorder (int, optional): Drawing layer z-order index for matplotlib. Defaults to 50.
+    """
+
+    for obs in obstacles:
+        positions = []
+        if (
+            hasattr(obs, 'prediction') 
+            and obs.prediction is not None
+            and hasattr(obs.prediction, 'trajectory')
+            and obs.prediction.trajectory is not None
+            ):
+            positions = [s.position for s in obs.prediction.trajectory.state_list]
+
+        if not positions:
+            for t in range(100):
+                st = obs.state_at_time(t)
+                if st is not None:
+                    positions.append(st.position)
+                else:
+                    break
+
+        if len(positions) > 1:
+            path = np.array(positions)
+            ax.plot(path[:, 0], path[:, 1], color="black", linestyle=(0, (1, 2)), linewidth=1.2, zorder=zorder)
+
+def render_frame(
+        scenario,
+        planning_problem_set,
+        ego: EgoState,
+        sensor_suite: SensorSuite,
+        d_safe,
+        h_val,
+        surrounding_states,
+        has_collided,
+        step,
+        num_steps,
+        frame_path,
+        show_trajectories: bool = False,
+    ):
+    """
+    Renders simulation frame with Radar/USS FOV wedges, CBF safety buffer, and ego tracking camera.
+
+    Args:
+        scenario (object): CommonRoad scenario instance containing lanelet network and metadata.
+        planning_problem_set (object): CommonRoad planning problem set for goal region display.
+        ego (EgoState): Current Ego vehicle state object.
+        sensor_suite (SensorSuite): Sensor suite containing active radar and ultrasonic sensors.
+        d_safe (float): Calculated safe longitudinal distance buffer in meters.
+        h_val (float | None): Control Barrier Function barrier value h(x), if available.
+        surrounding_states (list[tuple[object, np.ndarray, bool]]): List of tuples (obstacle, corners, is_hit) for surrounding traffic.
+        has_collided (bool): Whether a collision has occurred at this step.
+        step (int): Current simulation time step index.
+        num_steps (int): Total number of simulation steps.
+        frame_path (Path): File path where the rendered PNG frame image will be saved.
+        show_trajectories (bool, optional): Whether to draw predicted paths for traffic. Defaults to False.
+    """
+
+    front_radar = sensor_suite.front_radar
+    rear_radar = sensor_suite.rear_radar
+    uss_left = sensor_suite.uss_left
+    uss_right = sensor_suite.uss_right
+
+    #front_tracked_ids = sensor_suite.front_tracked_ids
+    #rear_tracked_ids = sensor_suite.rear_tracked_ids
+    #left_tracked_ids = sensor_suite.left_tracked_ids
+    #right_tracked_ids = sensor_suite.right_tracked_ids
+
+    lead_target = sensor_suite.latest_perception.lead_target
+    lead_target_id = lead_target.associated_obstacle_id if lead_target is not None else None
+
+    _, ax = plt.subplots(figsize=(12, 7))
+    renderer = MPRenderer(ax=ax)
+
+    scenario.lanelet_network.draw(renderer)
+    planning_problem_set.draw(renderer)
+    renderer.render()
+
+    # Dim yellow goal region patch intensity so it doesn't obscure vehicles
+    for patch in ax.patches:
+        patch.set_zorder(1)
+        if patch.get_facecolor() in [(1.0, 0.8, 0.0, 1.0), (1.0, 0.7568627450980392, 0.027450980392156862, 1.0)]:
+            patch.set_alpha(0.35)
+
+    # 1. Optionally draw trajectory predictions for obstacles
+    if show_trajectories:
+        draw_obstacle_trajectories(ax, [obs for obs, _, _ in surrounding_states], zorder=50)
+
+    front_pos = ego.position + (ego.length / 2.0) * ego.heading_vector
+
+    # 2. Render Radar and USS FOV Cone
+    if front_radar is not None:
+         front_scan = front_radar.scan(ego, [obs for obs, _, _ in surrounding_states], step)
+         plot_shapely_geometry(ax, front_scan.get("visible_fov"), facecolor="#00E5FF", edgecolor="#0099CC", alpha=0.22, zorder=70)
+
+    if rear_radar is not None:
+        rear_scan = rear_radar.scan(ego, [obs for obs, _, _ in surrounding_states], step)
+        plot_shapely_geometry(ax, rear_scan.get("visible_fov"), facecolor="#AB47BC", edgecolor="#7B1FA2", alpha=0.22, zorder=70)
+
+    if uss_left is not None:
+        left_scan = uss_left.scan(ego, [obs for obs, _, _ in surrounding_states], step)
+        plot_shapely_geometry(ax, left_scan.get("visible_fov"), facecolor="#FFE082", edgecolor="#FFA000", alpha=0.40, zorder=70)
+
+    if uss_right is not None:
+        right_scan = uss_right.scan(ego, [obs for obs, _, _ in surrounding_states], step)
+        plot_shapely_geometry(ax, right_scan.get("visible_fov"), facecolor="#FFE082", edgecolor="#FFA000", alpha=0.40, zorder=70)
+
+
+    # 3. Render CBF Safety Buffer Zone
+    w2 = ego.width / 2.0
+    local_buffer = np.array([
+        [0.0, -w2],
+        [d_safe, -w2],
+        [d_safe, w2],
+        [0.0, w2]
+    ])
+    world_buffer = front_pos + np.outer(local_buffer[:,0], ego.heading_vector) + np.outer(local_buffer[:,1], ego.normal_vector)
+
+    if h_val is None or h_val > 5.0:
+        zone_color, zone_alpha = "#2ECC71", 0.25
+    elif h_val > 0.0:
+        zone_color, zone_alpha = "#FF6D00", 0.50
+    else:
+        zone_color, zone_alpha = "#E74C3C", 0.55
+
+    ax.add_patch(patches.Polygon(
+        world_buffer, closed=True, 
+        facecolor=zone_color, edgecolor="black", 
+        alpha=zone_alpha, linestyle="--", linewidth=1.5, zorder=80
+    ))
+
+    merge_horizon_min = 2.3 * ego.velocity
+    min_horizon_end = front_pos + merge_horizon_min * ego.heading_vector
+
+    ax.plot(
+        [front_pos[0], min_horizon_end[0]],
+        [front_pos[1], min_horizon_end[1]],
+        color="#FF007F",
+        linestyle="--",
+        linewidth=2.0,
+        zorder=85,
+    )
+    # Optional marker at the end of the horizon line
+    ax.plot(
+        min_horizon_end[0], min_horizon_end[1],
+        marker="o",
+        color="#FF007F",
+        markersize=5,
+        zorder=85
+    )
+
+    merge_horizon_max = 3 * ego.velocity
+    max_horizon_end = front_pos + merge_horizon_max * ego.heading_vector
+
+    ax.plot(
+        [front_pos[0], max_horizon_end[0]],
+        [front_pos[1], max_horizon_end[1]],
+        color="#33BB7F",
+        linestyle="--",
+        linewidth=2.0,
+        zorder=85,
+    )
+    # Optional marker at the end of the horizon line
+    ax.plot(
+        max_horizon_end[0], max_horizon_end[1],
+        marker="o",
+        color="#33BB7F",
+        markersize=5,
+        zorder=85
+    )
+
+    # 4. Render Surrounding Vehicles
+    active_sensors = [
+            (front_radar, "#00E5FF"),
+            (rear_radar, "#E040FB"),
+            (uss_left, "#FFB300"),
+            (uss_right,"#FFB300")]
+    track_state_color = { 
+                         "CONFIRMED" : "#2ECC71",
+                         "TENTATIVE" : "#F39C12",
+                         "DELETED" : "#E74C3C"
+                         }
+    for obs, corners, is_hit in surrounding_states:
+        obs_id = obs.obstacle_id
+        obs_color = "#E67E22" if is_hit else "#1F77B4"
+
+        if lead_target_id is not None and obs.obstacle_id == lead_target_id:
+            obs_state = obs.state_at_time(step)
+            if obs_state is not None:
+                pos = obs_state.position
+                ax.plot(pos[0], pos[1], marker="X", markersize=10, color="red", zorder=105)
+
+        ax.add_patch(patches.Polygon(
+            corners, closed=True, 
+            facecolor=obs_color, edgecolor="black", 
+            linewidth=1.0, zorder=100
+        ))
+
+        # Find matching tracked object near the ground-truth obstacle center
+        obs_center = np.mean(corners, axis=0)
+        hazard_track = sensor_suite.merge_hazard
+
+        for track in sensor_suite.tracked_objects:
+            if np.linalg.norm(track.position - obs_center) < 3.0:
+                trk_bg_color = track_state_color[track.state.name]
+                ax.text(
+                    obs_center[0], obs_center[1],
+                    f"#{track.track_id}",
+                    color="black",
+                    fontsize=8,
+                    fontweight="bold",
+                    ha="center",
+                    va="center",
+                    bbox={
+                        'boxstyle': "round, pad=0.1",
+                        'facecolor': trk_bg_color,
+                        'edgecolor': "black",
+                        'linewidth': 0.8,
+                        'alpha': 0.85
+                        },
+                    zorder=120
+                )
+                if hazard_track is not None and np.linalg.norm(hazard_track.position - obs_center) < 3.0:
+                    ax.add_patch(patches.Polygon(
+                        corners, closed=True, 
+                        facecolor="#44329F", edgecolor="blue", 
+                        linewidth=1.0, zorder=100
+                    ))
+                    ax.text(
+                            obs_center[0], obs_center[1] + 4.5,
+                            "MERGE HAZARD",
+                            color="yellow",
+                            fontsize=8,
+                            fontweight="bold",
+                            ha="center",
+                            bbox={'boxstyle': "round,pad=0.2", 'facecolor': "#B71C1C", 'alpha': 0.9},
+                            zorder=125
+                        )
+                break
+
+        for sensor, highlight_color in active_sensors:
+            if sensor is None:
+                continue
+            scan_data = sensor.scan(ego, [obs for obs, _, _ in surrounding_states], step)
+            occ_data = scan_data["fov_data"].get(obs_id)
+
+            if occ_data and occ_data.in_fov:
+                for seg_coords in occ_data.visible_segments:
+                    ax.plot(
+                            seg_coords[:, 0], seg_coords[:, 1],
+                            color=highlight_color, linewidth=3.0,
+                            solid_capstyle='round', zorder=105
+                            )
+
+
+   # 5. Render Ego Vehicle
+    
+    ego_color = "#FF0000" if has_collided else "#00FF00"
+    ax.add_patch(patches.Polygon(
+        ego.corners, closed=True,
+        facecolor=ego_color,
+        edgecolor="yellow" if has_collided else "black",
+        linewidth=2.0 if has_collided else 1.2,
+        zorder=110
+    ))
+
+    # 6. Legend & Information
+
+    ax.plot([], [], color="#00FF00", marker="s", ls="", markersize=8, label="Ego Vehicle")
+
+    ax.plot([], [], color="#FF007F", marker="o", ls="--", markersize=5, label=f"Merge Horizon (min:{merge_horizon_min:.1f}m)")
+
+    ax.plot([], [], color="#33BB7F", marker="o", ls="--", markersize=5, label=f"Merge Horizon (min:{merge_horizon_max:.1f}m)")
+
+    ax.plot([], [], color=zone_color, linestyle="--", linewidth=1, label=f"CBF Buffer ({d_safe:.1f}m)")
+
+#    ax.plot([], [], color="#0099CC", linestyle="-", label=f"Front Radar ({front_radar.range_max:.0f}m, {front_radar.fov_deg:.0f}°)")
+#    
+#    if rear_radar is not None:
+#        ax.plot([], [], color="#7B1FA2", linestyle="-", label=f"Rear Radar ({rear_radar.range_max:.0f}m, {rear_radar.fov_deg:.0f}°)")
+#
+#    if uss_left is not None:
+#        ax.plot([], [], color="#FFA000", linestyle="-", label=f"Ultrasonic Sensor ({uss_left.range_max:.0f}m, {uss_left.fov_deg:.0f}°)")
+#
+#    if uss_right is not None:
+#        ax.plot([], [], color="#FFA000", linestyle="-", label=f"Ultrasonic Sensor ({uss_right.range_max:.0f}m, {uss_right.fov_deg:.0f}°)")
+#
+
+    if lead_target is not None:
+        ax.plot([], [], color="red", marker="X", ls="", markersize=9, label="Lead Target Vehicle")
+
+#    if front_tracked_ids:
+#        ax.plot([], [], color="#00E5FF", linestyle="-", linewidth=2.5, label="Front Tracked Vehicle")
+#
+#    if rear_tracked_ids:
+#        ax.plot([], [], color="#E040FB", linestyle="-", linewidth=2.5, label="Rear Tracked Vehicle")
+#
+#    if left_tracked_ids or right_tracked_ids:
+#        ax.plot([], [], color="#FFB300", linestyle="-", linewidth=2.5, label="Side USS Tracked")
+       
+    if show_trajectories:
+        ax.plot([], [], color="black", linestyle=":", label="Obstacle Trajectory")
+
+    if has_collided:
+        ax.plot([], [], color="#FF0000", marker="X", ls="", markersize=10, label="COLLISION FROZEN")
+
+    leg = ax.legend(loc="upper right", framealpha=0.85)
+    leg.set_zorder(200)
+
+    # 7. Camera Frame Tracking
+    view_margin = 45.0
+    ax.set_xlim(ego.x - view_margin, ego.x + view_margin)
+    ax.set_ylim(ego.y - view_margin, ego.y + view_margin)
+    ax.set_aspect('equal')
+
+    h_str = f" | h(x)={h_val:.2f}" if h_val is not None else " | h(x)=N/A"
+    title_text = f"{scenario.scenario_id} | Step {step}/{num_steps} (t={step * scenario.dt:.1f}s) | v={ego.velocity:.1f} m/s{h_str}"
+    if has_collided:
+        title_text += " ⚠️ COLLISION FROZEN!"
+    
+    ax.set_title(title_text, color="red" if has_collided else "black", fontweight="bold" if has_collided else "normal")
+    ax.grid(True, linestyle=":", alpha=0.6)
+
+    plt.savefig(frame_path, dpi=100, bbox_inches='tight')
+    plt.close('all')
+
